@@ -1,6 +1,7 @@
 ;; Dynamic Market Maker - Clarinet Compliant Version
 ;; A dynamic market maker that adjusts parameters based on market conditions
 
+;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-authorized (err u101))
@@ -43,7 +44,7 @@
 (define-data-var price-deviation-threshold uint u200) ;; 2% threshold for price deviation
 (define-data-var max-dynamic-fee-increase uint u500) ;; Maximum 5% fee increase
 
-;; Supported tokens
+;; Data maps
 (define-map token-registry
   { token-id: (string-ascii 20) }
   {
@@ -60,13 +61,11 @@
   }
 )
 
-;; Price history entry structure
 (define-map price-history-entries
   { pool-id: uint, index: uint }
   { price: uint, timestamp: uint }
 )
 
-;; Concentrated range structure
 (define-map concentrated-ranges
   { pool-id: uint, range-id: uint }
   { 
@@ -77,7 +76,6 @@
   }
 )
 
-;; Liquidity pools
 (define-map liquidity-pools
   { pool-id: uint }
   {
@@ -114,7 +112,6 @@
   }
 )
 
-;; Liquidity positions
 (define-map liquidity-positions
   { position-id: uint }
   {
@@ -139,7 +136,6 @@
   }
 )
 
-;; User positions index
 (define-map user-position-count
   { user: principal }
   { count: uint }
@@ -150,7 +146,6 @@
   { position-id: uint }
 )
 
-;; Pool positions index
 (define-map pool-position-count
   { pool-id: uint }
   { count: uint }
@@ -161,7 +156,6 @@
   { position-id: uint }
 )
 
-;; Oracle price data
 (define-map oracle-prices
   { token-id: (string-ascii 20) }
   {
@@ -173,7 +167,11 @@
   }
 )
 
-;; Helper functions
+;; Helper functions (must be defined before public functions)
+(define-private (min-uint (a uint) (b uint))
+  (if (<= a b) a b)
+)
+
 (define-private (is-authorized-caller)
   (is-eq tx-sender contract-owner)
 )
@@ -251,7 +249,7 @@
   )
     (if (> liquidity-x u0)
       (if (> liquidity-y u0)
-        (min liquidity-x liquidity-y)
+        (min-uint liquidity-x liquidity-y)
         liquidity-x)
       liquidity-y)
   )
@@ -283,7 +281,7 @@
   (ok true)
 )
 
-;; Initialize the protocol
+;; Public functions
 (define-public (initialize (treasury principal))
   (begin
     (asserts! (is-authorized-caller) err-owner-only)
@@ -295,7 +293,6 @@
   )
 )
 
-;; Register a token
 (define-public (register-token
   (token-id (string-ascii 20))
   (name (string-ascii 40))
@@ -344,7 +341,6 @@
   )
 )
 
-;; Create a new liquidity pool
 (define-public (create-pool
   (token-x (string-ascii 20))
   (token-y (string-ascii 20))
@@ -418,7 +414,6 @@
   )
 )
 
-;; Add standard liquidity to a pool
 (define-public (add-liquidity
   (pool-id uint)
   (amount-x uint)
@@ -451,7 +446,7 @@
                    ;; First liquidity provision - use geometric mean
                    (sqrti (* amount-x amount-y))
                    ;; Proportional to existing reserves
-                   (min
+                   (min-uint
                      (/ (* amount-x current-liquidity) reserve-x)
                      (/ (* amount-y current-liquidity) reserve-y)
                    )))
@@ -518,7 +513,6 @@
   )
 )
 
-;; Add concentrated liquidity within a specific price range
 (define-public (add-concentrated-liquidity
   (pool-id uint)
   (amount-x uint)
@@ -636,7 +630,6 @@
   )
 )
 
-;; Remove liquidity from a pool
 (define-public (remove-liquidity
   (position-id uint)
   (lp-units uint)
@@ -725,7 +718,6 @@
   )
 )
 
-;; Swap tokens in a pool
 (define-public (swap
   (pool-id uint)
   (token-in (string-ascii 20))
@@ -802,7 +794,6 @@
   )
 )
 
-;; Update oracle price for a token
 (define-public (update-oracle-price
   (token-id (string-ascii 20))
   (new-price uint))
@@ -847,7 +838,6 @@
   )
 )
 
-;; Emergency functions
 (define-public (emergency-shutdown)
   (begin
     (asserts! (is-authorized-caller) err-owner-only)
