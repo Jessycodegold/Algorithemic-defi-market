@@ -55,3 +55,107 @@
 ;; Range status enumeration
 ;; 0 = Out-of-range, 1 = In-range, 2 = Partial-range
 (define-data-var range-statuses (list 3 (string-ascii 15)) (list "Out-of-range" "In-range" "Partial-range"))
+
+;; Supported tokens
+(define-map token-registry
+  { token-id: (string-ascii 20) }
+  {
+    name: (string-ascii 40),
+    token-type: (string-ascii 10), ;; "fungible" or "non-fungible"
+    contract: principal,
+    decimals: uint,
+    price-oracle: principal,
+    volatility-history: (list 30 uint), ;; Recent volatility measurements
+    current-volatility: uint, ;; Current volatility score 1-10000
+    is-stable: bool, ;; Is this a stablecoin
+    max-supply: uint,
+    last-price: uint, ;; Last price in STX with 8 decimals
+    last-update-block: uint
+  }
+)
+;; Liquidity pools
+(define-map liquidity-pools
+  { pool-id: uint }
+  {
+    token-x: (string-ascii 20),
+    token-y: (string-ascii 20),
+    reserve-x: uint,
+    reserve-y: uint,
+    virtual-reserve-x: uint, ;; Used for stableswap and custom curves
+    virtual-reserve-y: uint,
+    liquidity-units: uint, ;; Total liquidity shares
+    curve-type: uint,
+    curve-params: (list 5 uint), ;; Custom parameters for the curve
+    base-fee-bp: uint, ;; Base fee in basis points
+    dynamic-fee-bp: uint, ;; Additional dynamic fee based on volatility
+    current-tick: int, ;; Current price tick (log base 1.0001 of price)
+    tick-spacing: uint, ;; Minimum tick movement
+    price-oracle: principal,
+    total-volume-x: uint,
+    total-volume-y: uint,
+    total-fees-x: uint,
+    total-fees-y: uint,
+    total-fees-protocol: uint,
+    creation-block: uint,
+    last-update-block: uint,
+    status: uint, ;; 0=Active, 1=Paused, 2=Deprecated
+    price-history: (list 24 { price: uint, timestamp: uint }), ;; 24 hours of price history
+    volatility-adjustment: uint, ;; Dynamic adjustment to fee and ranges
+    concentrated-ranges: (list 10 { 
+      tick-lower: int, 
+      tick-upper: int, 
+      liquidity: uint, 
+      positions-count: uint 
+    }),
+    total-il-compensation-paid: uint
+  }
+)
+
+;; Liquidity positions
+(define-map liquidity-positions
+  { position-id: uint }
+  {
+    pool-id: uint,
+    provider: principal,
+    liquidity-units: uint, ;; Share of the pool
+    token-x-amount: uint,
+    token-y-amount: uint,
+    entry-price: uint, ;; Entry price for impermanent loss calculation
+    entry-sqrt-price: uint, ;; Square root of price at entry (for concentrated liquidity)
+    entry-block: uint,
+    last-update-block: uint,
+    tick-lower: int, ;; Lower tick bound for concentrated liquidity
+    tick-upper: int, ;; Upper tick bound for concentrated liquidity
+    range-status: uint, ;; 0=Out-of-range, 1=In-range, 2=Partial-range
+    fees-earned-x: uint,
+    fees-earned-y: uint,
+    rewards-earned: uint,
+    rewards-claimed: uint,
+    il-compensation: uint,
+    is-concentrated: bool ;; Is this a concentrated liquidity position
+  }
+)
+
+;; User positions index
+(define-map user-positions
+  { user: principal }
+  { position-ids: (list 100 uint) }
+)
+
+;; Pool positions index
+(define-map pool-positions
+  { pool-id: uint }
+  { position-ids: (list 500 uint) }
+)
+
+;; Oracle price data
+(define-map oracle-prices
+  { token-id: (string-ascii 20) }
+  {
+    price: uint, ;; Price in STX with 8 decimals
+    last-update-block: uint,
+    twap-price: uint, ;; Time-weighted average price
+    trusted: bool,
+    oracle-address: principal
+  }
+)
