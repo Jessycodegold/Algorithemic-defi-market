@@ -159,3 +159,563 @@
     oracle-address: principal
   }
 )
+
+;; Initialize the protocol
+(define-public (initialize (treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set treasury-address treasury)
+    (var-set protocol-fee-bp u30) ;; 0.3%
+    (var-set min-deposit-amount u1000000) ;; 1 STX
+    (var-set emergency-shutdown false)
+    (ok true)
+  )
+)
+
+;; Register a token
+(define-public (register-token
+  (token-id (string-ascii 20))
+  (name (string-ascii 40))
+  (token-type (string-ascii 10))
+  (contract principal)
+  (decimals uint)
+  (price-oracle principal)
+  (is-stable bool)
+  (max-supply uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (is-none (map-get? token-registry { token-id: token-id })) err-token-exists)
+    ;; Create token registry entry
+    (map-set token-registry
+      { token-id: token-id }
+      {
+        name: name,
+        token-type: token-type,
+        contract: contract,
+        decimals: decimals,
+        price-oracle: price-oracle,
+        volatility-history: (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0),
+        current-volatility: u1000, ;; Start with medium volatility (10%)
+        is-stable: is-stable,
+        max-supply: max-supply,
+        last-price: u0,
+        last-update-block: block-height
+      }
+    )
+    ;; Initialize oracle entry
+    (map-set oracle-prices
+      { token-id: token-id }
+      {
+        price: u0,
+        last-update-block: block-height,
+        twap-price: u0,
+        trusted: true,
+        oracle-address: price-oracle
+      }
+    )
+    (ok token-id)
+  )
+)
+
+;; Create a new liquidity pool
+(define-public (create-pool
+  (token-x (string-ascii 20))
+  (token-y (string-ascii 20))
+  (curve-type uint)
+  (curve-params (list 5 uint))
+  (base-fee-bp uint)
+  (tick-spacing uint))
+  (let (
+    (pool-id (var-get next-pool-id))
+    (token-x-info (unwrap! (map-get? token-registry { token-id: token-x }) err-token-not-found))
+    (token-y-info (unwrap! (map-get? token-registry { token-id: token-y }) err-token-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (< curve-type u4) err-invalid-curve) ;; Valid curve type
+    (asserts! (<= base-fee-bp u500) err-invalid-parameters) ;; Max 5% base fee
+    (asserts! (> tick-spacing u0) err-invalid-parameters) ;; Tick spacing must be positive
+    ;; Create pool
+    (map-set liquidity-pools
+      { pool-id: pool-id }
+      {
+        token-x: token-x,
+        token-y: token-y,
+        reserve-x: u0,
+        reserve-y: u0,
+        virtual-reserve-x: u0,
+        virtual-reserve-y: u0,
+        liquidity-units: u0,
+        curve-type: curve-type,
+        curve-params: curve-params,
+        base-fee-bp: base-fee-bp,
+        dynamic-fee-bp: u0, ;; Start with no dynamic fee
+        current-tick: (convert-to-int 0), ;; Start at price = 1.0
+        tick-spacing: tick-spacing,
+        price-oracle: (get price-oracle token-x-info), ;; Use token X's oracle by default
+        total-volume-x: u0,
+        total-volume-y: u0,
+        total-fees-x: u0,
+        total-fees-y: u0,
+        total-fees-protocol: u0,
+        creation-block: block-height,
+        last-update-block: block-height,
+        status: u0, ;; Active
+        price-history: (list),
+        volatility-adjustment: u1000, ;; Start with 10% volatility adjustment
+        concentrated-ranges: (list),
+        total-il-compensation-paid: u0
+      }
+    )
+    ;; Initialize pool positions list
+    (map-set pool-positions
+      { pool-id: pool-id }
+      { position-ids: (list) }
+    )
+    ;; Increment pool ID counter
+    (var-set next-pool-id (+ pool-id u1))
+    (ok { pool-id: pool-id })
+  )
+)
+
+;; Add standard liquidity to a pool
+(define-public (add-liquidity
+  (pool-id uint)
+  (amount-x uint)
+  (amount-y uint)
+  (min-lp-units uint))
+  (let (
+    (provider tx-sender)
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+    (token-x (get token-x pool))
+    (token-y (get token-y pool))
+    (token-x-info (unwrap! (map-get? token-registry { token-id: token-x }) err-token-not-found))
+    (token-y-info (unwrap! (map-get? token-registry { token-id: token-y }) err-token-not-found))
+    (position-id (var-get next-position-id))
+  )
+    ;; Validation
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (is-eq (get status pool) u0) err-paused) ;; Pool must be active
+    (asserts! (> amount-x u0) err-zero-amount)
+    (asserts! (> amount-y u0) err-zero-amount)
+    (asserts! (>= amount-x (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    (asserts! (>= amount-y (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    ;; Calculate liquidity units (LP tokens)
+    (let (
+      (current-liquidity (get liquidity-units pool))
+      (reserve-x (get reserve-x pool))
+      (reserve-y (get reserve-y pool))
+      (lp-units (if (is-eq current-liquidity u0)
+                   ;; First liquidity provision - use geometric mean
+                   (sqrti (* amount-x amount-y))
+                   ;; Proportional to existing reserves
+                   (min
+                     (/ (* amount-x current-liquidity) reserve-x)
+                     (/ (* amount-y current-liquidity) reserve-y)
+                   )))
+    )
+      ;; Ensure minimum liquidity
+      (asserts! (>= lp-units min-lp-units) err-slippage-too-high)
+      ;; Transfer tokens to pool
+      (try! (transfer-token token-x amount-x provider (as-contract tx-sender)))
+      (try! (transfer-token token-y amount-y provider (as-contract tx-sender)))
+      ;; Update pool state
+      (map-set liquidity-pools
+        { pool-id: pool-id }
+        (merge pool {
+          reserve-x: (+ reserve-x amount-x),
+          reserve-y: (+ reserve-y amount-y),
+          liquidity-units: (+ current-liquidity lp-units),
+          last-update-block: block-height
+        })
+      )
+      ;; Create liquidity position
+      (map-set liquidity-positions
+        { position-id: position-id }
+        {
+          pool-id: pool-id,
+          provider: provider,
+          liquidity-units: lp-units,
+          token-x-amount: amount-x,
+          token-y-amount: amount-y,
+          entry-price: (calculate-price pool),
+          entry-sqrt-price: (sqrti (/ reserve-y reserve-x)),
+          entry-block: block-height,
+          last-update-block: block-height,
+          tick-lower: (convert-to-int 0), ;; Full range
+          tick-upper: (convert-to-int 0), ;; Full range
+          range-status: u1, ;; In-range
+          fees-earned-x: u0,
+          fees-earned-y: u0,
+          rewards-earned: u0,
+          rewards-claimed: u0,
+          il-compensation: u0,
+          is-concentrated: false
+        }
+      )
+      ;; Update user's positions list
+      (let (
+        (user-pos (default-to { position-ids: (list) } (map-get? user-positions { user: provider })))
+        (updated-user-pos (merge user-pos {
+          position-ids: (append (get position-ids user-pos) position-id)
+        }))
+      )
+        (map-set user-positions
+          { user: provider }
+          updated-user-pos
+        )
+      )
+      ;; Update pool's positions list
+      (let (
+        (pool-pos (default-to { position-ids: (list) } (map-get? pool-positions { pool-id: pool-id })))
+        (updated-pool-pos (merge pool-pos {
+          position-ids: (append (get position-ids pool-pos) position-id)
+        }))
+      )
+        (map-set pool-positions
+          { pool-id: pool-id }
+          updated-pool-pos
+        )
+      )
+      ;; Increment position ID counter
+      (var-set next-position-id (+ position-id u1))
+      (ok { position-id: position-id })
+    )
+  )
+)
+
+;; Calculate current price of the pool
+(define-public (calculate-price (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+    (reserve-x (get reserve-x pool))
+    (reserve-y (get reserve-y pool))
+    (current-tick (get current-tick pool))
+    (tick-spacing (get tick-spacing pool))
+  )
+    ;; Price = sqrt(reserve-y / reserve-x) * (1.0001 ^ current-tick)
+    (ok (convert-to-uint (* (sqrti (/ reserve-y reserve-x)) (pow 10001 current-tick))))
+  )
+)
+
+;; Emergency shutdown
+(define-public (shutdown-emergency)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-shutdown true)
+    (ok true)
+  )
+)
+
+;; Recover funds in emergency
+(define-public (emergency-withdraw (token-id (string-ascii 20)) (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (let (
+      (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+      (contract-address (get contract token-info))
+    )
+      (try! (transfer-token token-id amount contract-owner (as-contract contract-address)))
+    )
+    (ok true)
+  )
+)
+
+;; Update price oracle
+(define-public (update-price-oracle
+  (token-id (string-ascii 20))
+  (new-oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let (
+      (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+    )
+      (map-set token-registry
+        { token-id: token-id }
+        (merge token-info {
+          price-oracle: new-oracle,
+          last-update-block: block-height
+        })
+      )
+      (map-set oracle-prices
+        { token-id: token-id }
+        {
+          price: (get last-price token-info),
+          last-update-block: block-height,
+          twap-price: (get last-price token-info),
+          trusted: true,
+          oracle-address: new-oracle
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Update volatility
+(define-public (update-volatility (token-id (string-ascii 20)) (new-volatility uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let (
+      (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+    )
+      (map-set token-registry
+        { token-id: token-id }
+        (merge token-info {
+          current-volatility: new-volatility,
+          last-update-block: block-height
+        })
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Settle fees and rewards
+(define-public (settle-fees-rewards (pool-id uint))
+  (begin
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (let (
+      (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+      (total-fees-x (get total-fees-x pool))
+      (total-fees-y (get total-fees-y pool))
+      (total-volume-x (get total-volume-x pool))
+      (total-volume-y (get total-volume-y pool))
+      (protocol-fee-bp (var-get protocol-fee-bp))
+      (fee-share-x (/ (* total-fees-x protocol-fee-bp) total-volume-x))
+      (fee-share-y (/ (* total-fees-y protocol-fee-bp) total-volume-y))
+    )
+      ;; Update pool reserves
+      (map-set liquidity-pools
+        { pool-id: pool-id }
+        (merge pool {
+          reserve-x: (- (get reserve-x pool) fee-share-x),
+          reserve-y: (- (get reserve-y pool) fee-share-y),
+          total-fees-x: u0,
+          total-fees-y: u0,
+          last-update-block: block-height
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Claim rewards
+(define-public (claim-rewards (position-id uint))
+  (begin
+    (let (
+      (position (unwrap! (map-get? liquidity-positions { position-id: position-id }) err-position-not-found))
+      (pool (unwrap! (map-get? liquidity-pools { pool-id: (get pool-id position) }) err-pool-not-found))
+      (provider (get provider position))
+      (il-compensation (get il-compensation position))
+      (total-il-compensation-paid (get total-il-compensation-paid pool))
+      (new-total-il-compensation-paid (+ total-il-compensation-paid il-compensation))
+    )
+      (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+      (asserts! (is-eq (get status pool) u0) err-paused) ;; Pool must be active
+      (asserts! (>= il-compensation (- (get reserve-x pool) (get total-fees-x pool))) err-insufficient-balance)
+      ;; Update position
+      (map-set liquidity-positions
+        { position-id: position-id }
+        (merge position {
+          rewards-claimed: (+ (get rewards-claimed position) il-compensation),
+          il-compensation: 0,
+          last-update-block: block-height
+        })
+      )
+      ;; Update pool
+      (map-set liquidity-pools
+        { pool-id: (get pool-id position) }
+        (merge pool {
+          total-il-compensation-paid: new-total-il-compensation-paid,
+          last-update-block: block-height
+        })
+      )
+      ;; Transfer compensation
+      (try! (transfer-token (get token-x pool) il-compensation provider (as-contract tx-sender)))
+      (try! (transfer-token (get token-y pool) il-compensation provider (as-contract tx-sender)))
+      (ok true)
+    )
+  )
+)
+
+;; Update protocol parameters
+(define-public (update-protocol-parameters
+  (new-fee-bp uint)
+  (new-min-deposit uint)
+  (new-volatility-update-frequency uint)
+  (new-max-price-impact-bp uint)
+  (new-impermanent-loss-threshold uint)
+  (new-impermanent-loss-coverage-bp uint)
+  (new-dynamic-range-adjustment-factor uint)
+  (new-price-deviation-threshold uint)
+  (new-max-dynamic-fee-increase uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-fee-bp u500) err-invalid-parameters) ;; Max 5% base fee
+    (asserts! (>= new-min-deposit u1000000) err-min-deposit) ;; Minimum 1 STX
+    (asserts! (>= new-volatility-update-frequency u144) err-invalid-parameters) ;; At least once per hour
+    (asserts! (<= new-max-price-impact-bp u500) err-invalid-parameters) ;; Max 5% price impact
+    (asserts! (<= new-impermanent-loss-threshold u500) err-invalid-parameters) ;; Max 5% IL threshold
+    (asserts! (<= new-impermanent-loss-coverage-bp u5000) err-invalid-parameters) ;; Max 50% IL coverage
+    (asserts! (<= new-dynamic-range-adjustment-factor u500) err-invalid-parameters) ;; Max 5% range adjustment
+    (asserts! (<= new-price-deviation-threshold u200) err-invalid-parameters) ;; Max 2% price deviation
+    (asserts! (<= new-max-dynamic-fee-increase u500) err-invalid-parameters) ;; Max 5% fee increase
+    ;; Update parameters
+    (var-set protocol-fee-bp new-fee-bp)
+    (var-set min-deposit-amount new-min-deposit)
+    (var-set volatility-update-frequency new-volatility-update-frequency)
+    (var-set max-price-impact-bp new-max-price-impact-bp)
+    (var-set impermanent-loss-threshold new-impermanent-loss-threshold)
+    (var-set impermanent-loss-coverage-bp new-impermanent-loss-coverage-bp)
+    (var-set dynamic-range-adjustment-factor new-dynamic-range-adjustment-factor)
+    (var-set price-deviation-threshold new-price-deviation-threshold)
+    (var-set max-dynamic-fee-increase new-max-dynamic-fee-increase)
+    (ok true)
+  )
+)
+
+;; Pause or unpause the contract
+(define-public (set-pause (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-shutdown paused)
+    (ok true)
+  )
+)
+
+;; Update the treasury address
+(define-public (update-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set treasury-address new-treasury)
+    (ok true)
+  )
+)
+
+;; Update the price oracles for all tokens
+(define-public (update-all-oracles)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-map
+      (lambda (token-id token-info)
+        (let (
+          (oracle-address (get price-oracle token-info))
+          (last-price (get last-price token-info))
+        )
+          (map-set oracle-prices
+            { token-id: token-id }
+            {
+              price: last-price,
+              last-update-block: block-height,
+              twap-price: last-price,
+              trusted: true,
+              oracle-address: oracle-address
+            }
+          )
+        )
+      )
+      token-registry
+    )
+    (ok true)
+  )
+)
+
+;; Admin recovery of tokens
+(define-public (admin-recover-token (token-id (string-ascii 20)) (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let (
+      (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+      (contract-address (get contract token-info))
+    )
+      (try! (transfer-token token-id amount contract-owner (as-contract contract-address)))
+    )
+    (ok true)
+  )
+)
+
+;; Admin recovery of STX
+(define-public (admin-recover-stx (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (try! (stx-transfer? contract-owner amount))
+    (ok true)
+  )
+)
+
+;; View functions
+
+;; Get the current price of a token in STX
+(define-public (get-token-price (token-id (string-ascii 20)))
+  (let (
+    (oracle-data (unwrap! (map-get? oracle-prices { token-id: token-id }) err-token-not-found))
+  )
+    (ok (get price oracle-data))
+  )
+)
+
+;; Get the total supply of a token
+(define-public (get-token-supply (token-id (string-ascii 20)))
+  (let (
+    (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+  )
+    (ok (get max-supply token-info))
+  )
+)
+
+;; Get the reserves of a liquidity pool
+(define-public (get-pool-reserves (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+  )
+    (ok { reserve-x: (get reserve-x pool), reserve-y: (get reserve-y pool) })
+  )
+)
+
+;; Get the total fees accrued in a pool
+(define-public (get-pool-fees (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+  )
+    (ok { total-fees-x: (get total-fees-x pool), total-fees-y: (get total-fees-y pool) })
+  )
+)
+
+;; Get the current volatility of a token
+(define-public (get-token-volatility (token-id (string-ascii 20)))
+  (let (
+    (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+  )
+    (ok (get current-volatility token-info))
+  )
+)
+
+;; Get the price oracle of a token
+(define-public (get-token-oracle (token-id (string-ascii 20)))
+  (let (
+    (token-info (unwrap! (map-get? token-registry { token-id: token-id }) err-token-not-found))
+  )
+    (ok (get price-oracle token-info))
+  )
+)
+
+;; Get the status of a liquidity pool
+(define-public (get-pool-status (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+  )
+    (ok (get status pool))
+  )
+)
+
+;; Get the list of active pools
+(define-public (get-active-pools)
+  (let (
+    (all-pools (map-get-all liquidity-pools))
+    (active-pools (filter (lambda (pool) (is-eq (get status pool) u0)) (map-get-all liquidity-pools)))
+  )
+    (ok (map (lambda (pool) { pool-id: (get pool-id pool), token-x: (get token-x pool), token-y: (get token-y pool), reserve-x: (get reserve-x pool), reserve-y: (get reserve-y pool), liquidity-units: (get liquidity-units pool), curve-type: (get curve-type pool), base-fee-bp: (get base-fee-bp pool), dynamic-fee-bp: (get dynamic-fee-bp pool), current-tick: (get current-tick pool), tick-spacing: (get tick-spacing pool), price-oracle: (get price-oracle pool), total-volume-x: (get total-volume-x pool), total-volume-y: (get total-volume-y pool), total-fees-x: (get total-fees-x pool), total-fees-y: (get total-fees-y pool), total-fees-protocol: (get total-fees-protocol pool), creation-block: (get creation-block pool), last-update-block: (get last-update-block pool), status: (get status pool), price-history: (get price-history pool), volatility-adjustment: (get volatility-adjustment pool), concentrated-ranges: (get concentrated-ranges pool), total-il-compensation-paid: (get total-il-compensation-paid pool) }
